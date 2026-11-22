@@ -18,11 +18,6 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-          info:
-      path: Info.plist
-      properties:
-        NSCameraUsageDescription: "Wymagany dostęp do aparatu dla ARKit"
-        NSLocalNetworkUsageDescription: "Wymagany dostęp do sieci lokalnej do komunikacji z Blenderem"
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           NSAllowsArbitraryLoads: true
