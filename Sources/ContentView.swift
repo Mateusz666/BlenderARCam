@@ -30,8 +30,8 @@ class MJPEGStreamClient: NSObject, ObservableObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         buffer.append(data)
-        let soi = Data([0xFF, 0xD8]) // Start of JPEG
-        let eoi = Data([0xFF, 0xD9]) // End of JPEG
+        let soi = Data([0xFF, 0xD8])
+        let eoi = Data([0xFF, 0xD9])
 
         while let startRange = buffer.range(of: soi),
               let endRange = buffer.range(of: eoi, in: startRange.upperBound..<buffer.endIndex) {
@@ -55,6 +55,7 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var isConnected = false
     @Published var isRecording = false
     @Published var smoothing: Float = 0.25
+    @Published var focalLength: Float = 35.0
 
     let arSession = ARSession()
     private var connection: NWConnection?
@@ -72,6 +73,10 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
         config.worldAlignment = .gravity
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
         hasInitialFrame = false
+    }
+
+    func recenter() {
+        startAR()
     }
 
     func connect(ip: String, port: UInt16) {
@@ -109,10 +114,11 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
 
         let recFlag = isRecording ? 1 : 0
         let msg = String(
-            format: "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%d",
+            format: "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%d,%.1f",
             smoothPos.x, smoothPos.y, smoothPos.z,
             smoothQuat.imag.x, smoothQuat.imag.y, smoothQuat.imag.z, smoothQuat.real,
-            recFlag
+            recFlag,
+            focalLength
         )
 
         if let data = msg.data(using: .utf8) {
@@ -169,9 +175,9 @@ struct ContentView: View {
 
             // Warstwa 3: Interfejs sterowania
             VStack {
-                HStack {
+                HStack(spacing: 10) {
                     Button(action: { showBlenderView.toggle() }) {
-                        Label(showBlenderView ? "Widok: Blender" : "Widok: Aparat",
+                        Label(showBlenderView ? "Blender" : "Aparat",
                               systemImage: showBlenderView ? "cube.transparent" : "camera")
                             .font(.caption.bold())
                             .padding(.horizontal, 12)
@@ -179,7 +185,18 @@ struct ContentView: View {
                             .background(.ultraThinMaterial)
                             .cornerRadius(10)
                     }
+
+                    Button(action: { arManager.recenter() }) {
+                        Label("Reset", systemImage: "arrow.counterclockwise")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(10)
+                    }
+
                     Spacer()
+
                     Button(action: { showSettings.toggle() }) {
                         Image(systemName: showSettings ? "chevron.up.circle.fill" : "gearshape.fill")
                             .font(.title2)
@@ -212,7 +229,16 @@ struct ContentView: View {
                             Text("Wygładzanie: \(Int(arManager.smoothing * 100))%")
                                 .font(.caption)
                                 .foregroundColor(.white)
+                                .frame(width: 120, alignment: .leading)
                             Slider(value: $arManager.smoothing, in: 0...0.85)
+                        }
+
+                        HStack {
+                            Text("Ogniskowa: \(Int(arManager.focalLength)) mm")
+                                .font(.caption)
+                                .foregroundColor(.white)
+                                .frame(width: 120, alignment: .leading)
+                            Slider(value: $arManager.focalLength, in: 16...100, step: 1)
                         }
                     }
                     .padding()
@@ -263,7 +289,11 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            UIApplication.shared.isIdleTimerDisabled = true
             arManager.startAR()
+        }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
         }
     }
 }
