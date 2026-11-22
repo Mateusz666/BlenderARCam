@@ -9,6 +9,7 @@ class MJPEGStreamClient: NSObject, ObservableObject, URLSessionDataDelegate {
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private var buffer = Data()
+    private let decodeQueue = DispatchQueue(label: "mjpeg.decode", qos: .userInitiated)
 
     func start(ip: String, port: String = "8080") {
         stop()
@@ -25,78 +26,150 @@ class MJPEGStreamClient: NSObject, ObservableObject, URLSessionDataDelegate {
         session?.invalidateAndCancel()
         task = nil
         session = nil
-        buffer.removeAll()
+        decodeQueue.async { self.buffer.removeAll() }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        buffer.append(data)
-        let soi = Data([0xFF, 0xD8])
-        let eoi = Data([0xFF, 0xD9])
+        decodeQueue.async {
+            self.buffer.append(data)
+            let soi = Data([0xFF, 0xD8])
+            let eoi = Data([0xFF, 0xD9])
+            var latestImage: UIImage?
 
-        while let startRange = buffer.range(of: soi),
-              let endRange = buffer.range(of: eoi, in: startRange.upperBound..<buffer.endIndex) {
-            let jpegData = buffer.subdata(in: startRange.lowerBound..<endRange.upperBound)
-            buffer.removeSubrange(buffer.startIndex..<endRange.upperBound)
-
-            if let image = UIImage(data: jpegData) {
-                DispatchQueue.main.async {
-                    self.currentFrame = image
+            while let startRange = self.buffer.range(of: soi),
+                  let endRange = self.buffer.range(of: eoi, in: startRange.upperBound..<self.buffer.endIndex) {
+                let jpegData = self.buffer.subdata(in: startRange.lowerBound..<endRange.upperBound)
+                self.buffer.removeSubrange(self.buffer.startIndex..<endRange.upperBound)
+                if let image = UIImage(data: jpegData) {
+                    latestImage = image
                 }
             }
-        }
-        if buffer.count > 1_000_000 {
-            buffer.removeAll()
+            if self.buffer.count > 500_000 {
+                self.buffer.removeAll()
+            }
+            if let img = latestImage {
+                DispatchQueue.main.async {
+                    self.currentFrame = img
+                }
+            }
         }
     }
 }
 
-// MARK: - Kontroler ARKit + UDP
+// MARK: - Kontroler ARKit + UDP (stabilny, na osobnym wątku)
 class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var isConnected = false
     @Published var isRecording = false
-    @Published var smoothing: Float = 0.25
+    @Published var smoothing: Float = 0.15
     @Published var focalLength: Float = 35.0
+    @Published var trackingOK = false
+    @Published var trackingText = "Kalibracja..."
 
     let arSession = ARSession()
+    private let arQueue = DispatchQueue(label: "arkit.delegate", qos: .userInteractive)
     private var connection: NWConnection?
     private var smoothPos = SIMD3<Float>(0, 0, 0)
     private var smoothQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var hasInitialFrame = false
 
+    // Lokalne kopie zmiennych dla wątku ARKit (bez blokowania głównego wątku)
+    private var _connected = false
+    private var _recording = false
+    private var _smoothing: Float = 0.15
+    private var _focalLength: Float = 35.0
+
     override init() {
         super.init()
         arSession.delegate = self
+        arSession.delegateQueue = arQueue
     }
 
     func startAR() {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
+        config.isAutoFocusEnabled = true
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics = []
+        }
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
-        hasInitialFrame = false
+        arQueue.async {
+            self.hasInitialFrame = false
+        }
     }
 
     func recenter() {
         startAR()
     }
 
+    func syncSettings() {
+        let s = smoothing
+        let f = focalLength
+        let r = isRecording
+        arQueue.async {
+            self._smoothing = s
+            self._focalLength = f
+            self._recording = r
+        }
+    }
+
     func connect(ip: String, port: UInt16) {
         disconnect()
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let host = NWEndpoint.Host(ip)
-        connection = NWConnection(host: host, port: nwPort, using: .udp)
-        connection?.start(queue: .global(qos: .userInteractive))
+        let conn = NWConnection(host: host, port: nwPort, using: .udp)
+        conn.start(queue: arQueue)
+        arQueue.async {
+            self.connection = conn
+            self._connected = true
+        }
         isConnected = true
+        syncSettings()
     }
 
     func disconnect() {
-        connection?.cancel()
-        connection = nil
+        arQueue.async {
+            self.connection?.cancel()
+            self.connection = nil
+            self._connected = false
+            self._recording = false
+        }
         isConnected = false
         isRecording = false
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard isConnected, let conn = connection else { return }
+        // 1. Sprawdź jakość śledzenia — odrzucaj uszkodzone klatki
+        switch frame.camera.trackingState {
+        case .normal:
+            if !trackingOK {
+                DispatchQueue.main.async {
+                    self.trackingOK = true
+                    self.trackingText = "Tracking OK"
+                }
+            }
+        case .limited(let reason):
+            let msg: String
+            switch reason {
+            case .excessiveMotion: msg = "Za szybki ruch"
+            case .insufficientFeatures: msg = "Za mało detali/światła"
+            case .initializing: msg = "Kalibracja..."
+            case .relocalizing: msg = "Odzyskiwanie pozycji..."
+            @unknown default: msg = "Ograniczony tracking"
+            }
+            DispatchQueue.main.async {
+                self.trackingOK = false
+                self.trackingText = msg
+            }
+            return // NIE wysyłaj błędnej klatki do Blendera
+        case .notAvailable:
+            DispatchQueue.main.async {
+                self.trackingOK = false
+                self.trackingText = "Brak trackingu"
+            }
+            return
+        }
+
+        guard _connected, let conn = connection else { return }
 
         let t = frame.camera.transform
         let rawPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
@@ -107,18 +180,18 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
             smoothQuat = rawQuat
             hasInitialFrame = true
         } else {
-            let alpha = max(0.05, 1.0 - smoothing)
+            let alpha = max(0.05, 1.0 - _smoothing)
             smoothPos = simd_mix(smoothPos, rawPos, SIMD3<Float>(repeating: alpha))
             smoothQuat = simd_slerp(smoothQuat, rawQuat, alpha)
         }
 
-        let recFlag = isRecording ? 1 : 0
+        let recFlag = _recording ? 1 : 0
         let msg = String(
             format: "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%d,%.1f",
             smoothPos.x, smoothPos.y, smoothPos.z,
             smoothQuat.imag.x, smoothQuat.imag.y, smoothQuat.imag.z, smoothQuat.real,
             recFlag,
-            focalLength
+            _focalLength
         )
 
         if let data = msg.data(using: .utf8) {
@@ -127,11 +200,11 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 }
 
-// MARK: - Podgląd ARKit w tle
+// MARK: - Podgląd aparatu (tylko gdy wybrany tryb Aparat, bez nadpisywania sesji)
 struct ARViewContainer: UIViewRepresentable {
     let session: ARSession
     func makeUIView(context: Context) -> ARView {
-        let view = ARView(frame: .zero)
+        let view = ARView(frame: .zero, cameraMode: .ar, automaticallyConfigureSession: false)
         view.session = session
         return view
     }
@@ -151,11 +224,6 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Warstwa 1: ARKit (zawsze aktywny dla śledzenia 6DOF)
-            ARViewContainer(session: arManager.arSession)
-                .ignoresSafeArea()
-
-            // Warstwa 2: Podgląd sceny z Blendera
             if showBlenderView {
                 Color.black.ignoresSafeArea()
                 if let frame = streamClient.currentFrame {
@@ -166,21 +234,24 @@ struct ContentView: View {
                 } else {
                     VStack(spacing: 8) {
                         ProgressView().tint(.white)
-                        Text(arManager.isConnected ? "Oczekiwanie na obraz z Blendera (HTTP:\(httpPort))..." : "Kliknij Połącz, aby uruchomić podgląd")
+                        Text(arManager.isConnected ? "Oczekiwanie na obraz z Blendera..." : "Kliknij Połącz")
                             .font(.caption)
                             .foregroundColor(.white.opacity(0.8))
                     }
                 }
+            } else {
+                ARViewContainer(session: arManager.arSession)
+                    .ignoresSafeArea()
             }
 
-            // Warstwa 3: Interfejs sterowania
+            // Interfejs sterowania
             VStack {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Button(action: { showBlenderView.toggle() }) {
                         Label(showBlenderView ? "Blender" : "Aparat",
                               systemImage: showBlenderView ? "cube.transparent" : "camera")
                             .font(.caption.bold())
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .background(.ultraThinMaterial)
                             .cornerRadius(10)
@@ -189,11 +260,25 @@ struct ContentView: View {
                     Button(action: { arManager.recenter() }) {
                         Label("Reset", systemImage: "arrow.counterclockwise")
                             .font(.caption.bold())
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .background(.ultraThinMaterial)
                             .cornerRadius(10)
                     }
+
+                    // Wskaźnik jakości trackingu ARKit
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(arManager.trackingOK ? Color.green : Color.orange)
+                            .frame(width: 8, height: 8)
+                        Text(arManager.trackingText)
+                            .font(.caption2.bold())
+                            .foregroundColor(.white)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.6))
+                    .cornerRadius(8)
 
                     Spacer()
 
@@ -201,7 +286,7 @@ struct ContentView: View {
                         Image(systemName: showSettings ? "chevron.up.circle.fill" : "gearshape.fill")
                             .font(.title2)
                             .foregroundColor(.white)
-                            .padding(8)
+                            .padding(6)
                             .background(.ultraThinMaterial)
                             .clipShape(Circle())
                     }
@@ -231,6 +316,7 @@ struct ContentView: View {
                                 .foregroundColor(.white)
                                 .frame(width: 120, alignment: .leading)
                             Slider(value: $arManager.smoothing, in: 0...0.85)
+                                .onChange(of: arManager.smoothing) { _ in arManager.syncSettings() }
                         }
 
                         HStack {
@@ -239,6 +325,7 @@ struct ContentView: View {
                                 .foregroundColor(.white)
                                 .frame(width: 120, alignment: .leading)
                             Slider(value: $arManager.focalLength, in: 16...100, step: 1)
+                                .onChange(of: arManager.focalLength) { _ in arManager.syncSettings() }
                         }
                     }
                     .padding()
@@ -249,7 +336,6 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Dolny pasek: Połącz + REC
                 HStack(spacing: 16) {
                     Button(action: {
                         if arManager.isConnected {
@@ -274,6 +360,7 @@ struct ContentView: View {
                     if arManager.isConnected {
                         Button(action: {
                             arManager.isRecording.toggle()
+                            arManager.syncSettings()
                         }) {
                             Text(arManager.isRecording ? "STOP REC" : "REC")
                                 .bold()
