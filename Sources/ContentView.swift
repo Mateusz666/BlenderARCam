@@ -72,11 +72,11 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
     private var smoothQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var hasInitialFrame = false
 
-    // Lokalne kopie zmiennych dla wątku ARKit (bez blokowania głównego wątku)
-    private var _connected = false
-    private var _recording = false
-    private var _smoothing: Float = 0.15
-    private var _focalLength: Float = 35.0
+    // Lokalne kopie zmiennych dla wątku ARKit
+    private var localConnected = false
+    private var localRecording = false
+    private var localSmoothing: Float = 0.15
+    private var localFocalLength: Float = 35.0
 
     override init() {
         super.init()
@@ -106,9 +106,9 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
         let f = focalLength
         let r = isRecording
         arQueue.async {
-            self._smoothing = s
-            self._focalLength = f
-            self._recording = r
+            self.localSmoothing = s
+            self.localFocalLength = f
+            self.localRecording = r
         }
     }
 
@@ -120,7 +120,7 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
         conn.start(queue: arQueue)
         arQueue.async {
             self.connection = conn
-            self._connected = true
+            self.localConnected = true
         }
         isConnected = true
         syncSettings()
@@ -130,15 +130,14 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
         arQueue.async {
             self.connection?.cancel()
             self.connection = nil
-            self._connected = false
-            self._recording = false
+            self.localConnected = false
+            self.localRecording = false
         }
         isConnected = false
         isRecording = false
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // 1. Sprawdź jakość śledzenia — odrzucaj uszkodzone klatki
         switch frame.camera.trackingState {
         case .normal:
             if !trackingOK {
@@ -160,7 +159,7 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
                 self.trackingOK = false
                 self.trackingText = msg
             }
-            return // NIE wysyłaj błędnej klatki do Blendera
+            return
         case .notAvailable:
             DispatchQueue.main.async {
                 self.trackingOK = false
@@ -169,7 +168,7 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
 
-        guard _connected, let conn = connection else { return }
+        guard localConnected, let conn = connection else { return }
 
         let t = frame.camera.transform
         let rawPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
@@ -180,18 +179,18 @@ class ARCamManager: NSObject, ObservableObject, ARSessionDelegate {
             smoothQuat = rawQuat
             hasInitialFrame = true
         } else {
-            let alpha = max(0.05, 1.0 - _smoothing)
+            let alpha = max(0.05, 1.0 - localSmoothing)
             smoothPos = simd_mix(smoothPos, rawPos, SIMD3<Float>(repeating: alpha))
             smoothQuat = simd_slerp(smoothQuat, rawQuat, alpha)
         }
 
-        let recFlag = _recording ? 1 : 0
+        let recFlag = localRecording ? 1 : 0
         let msg = String(
             format: "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%d,%.1f",
             smoothPos.x, smoothPos.y, smoothPos.z,
             smoothQuat.imag.x, smoothQuat.imag.y, smoothQuat.imag.z, smoothQuat.real,
             recFlag,
-            _focalLength
+            localFocalLength
         )
 
         if let data = msg.data(using: .utf8) {
